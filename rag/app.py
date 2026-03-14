@@ -13,14 +13,58 @@ Requires:
 
 import os
 import sys
+import time
 import argparse
 
+import yaml
 import streamlit as st
+import streamlit_authenticator as stauth
+
+
+# ---------------------------------------------------------------------------
+# Audit logging (HIPAA requirement: log who queried, when)
+# ---------------------------------------------------------------------------
+def _audit(query: str) -> None:
+    """Append one audit record per query. Logs timestamp, username, query
+    character count (NOT the query text itself — avoids double-storing PHI),
+    and model name."""
+    log_path = os.environ.get("AUDIT_LOG", "audit.log")
+    # Username forwarded by nginx via X-Remote-User header
+    try:
+        user = st.context.headers.get("X-Remote-User", "unknown")
+    except Exception:
+        user = "unknown"
+    entry = (
+        f"{time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}\t"
+        f"{user}\t"
+        f"{len(query)} chars\t"
+        f"medical-soap\n"
+    )
+    try:
+        with open(log_path, "a") as f:
+            f.write(entry)
+    except OSError:
+        pass  # non-fatal — don't break the UI if audit dir missing
+
+# ---------------------------------------------------------------------------
+# Authentication
+# ---------------------------------------------------------------------------
+def _load_authenticator():
+    config_path = os.path.join(os.path.dirname(__file__), "config.yaml")
+    with open(config_path) as f:
+        config = yaml.safe_load(f)
+    return stauth.Authenticate(
+        config["credentials"],
+        config["cookie"]["name"],
+        config["cookie"]["key"],
+        config["cookie"]["expiry_days"],
+    )
+
 
 # ---------------------------------------------------------------------------
 # Paths / defaults (must match chat.py)
 # ---------------------------------------------------------------------------
-DEFAULT_MODEL = "medical-soap"
+DEFAULT_MODEL = "llama-3.1-8b-instant"
 DEFAULT_DB = os.path.join(os.path.dirname(__file__), "chroma_db")
 DEFAULT_EMBED_MODEL = "all-MiniLM-L6-v2"
 COLLECTION_NAME = "mtsamples"
@@ -73,6 +117,90 @@ RULES:
 - The examples below are real MTSamples notes — use them for phrasing/format, not patient facts
 - Drug class accuracy is critical: lisinopril is an ACE inhibitor, metoprolol is a beta-blocker, etc.\
 """
+
+# ---------------------------------------------------------------------------
+# Auto-build index if missing (runs once on cold start)
+# ---------------------------------------------------------------------------
+CHUNK_SIZE = 400
+CHUNK_OVERLAP = 50
+BATCH_SIZE = 64
+DEFAULT_CSV = os.path.join(os.path.dirname(__file__), "..", "mtsamples.csv")
+
+
+def _chunk_text(text: str) -> list[str]:
+    words = text.split()
+    if not words:
+        return []
+    chunks, start = [], 0
+    while start < len(words):
+        end = min(start + CHUNK_SIZE, len(words))
+        chunks.append(" ".join(words[start:end]))
+        if end == len(words):
+            break
+        start += CHUNK_SIZE - CHUNK_OVERLAP
+    return chunks
+
+
+@st.cache_resource(show_spinner=False)
+def _ensure_collection_built(db_path: str, embed_model: str, csv_path: str):
+    """Build the Chroma index from the CSV if it doesn't exist yet."""
+    import chromadb
+    from chromadb.utils.embedding_functions import SentenceTransformerEmbeddingFunction
+    import pandas as pd
+
+    client = chromadb.PersistentClient(path=db_path)
+    embed_fn = SentenceTransformerEmbeddingFunction(model_name=embed_model)
+
+    # Check if already built
+    try:
+        col = client.get_collection(name=COLLECTION_NAME, embedding_function=embed_fn)
+        if col.count() > 0:
+            return  # already built
+    except Exception:
+        pass
+
+    # Build from CSV
+    if not os.path.exists(csv_path):
+        st.error(f"mtsamples.csv not found at {csv_path}. Cannot build index.")
+        st.stop()
+
+    with st.status("Building vector index from MTSamples (one-time, ~2 min)...", expanded=True) as status:
+        st.write("Loading CSV...")
+        df = pd.read_csv(csv_path, encoding="utf-8", on_bad_lines="skip")
+        df.columns = df.columns.str.strip()
+        df = df[df["transcription"].notna() & (df["transcription"].str.strip() != "")]
+
+        st.write(f"Chunking {len(df)} transcriptions...")
+        texts, metadatas, ids = [], [], []
+        for i, row in df.iterrows():
+            for j, chunk in enumerate(_chunk_text(str(row.get("transcription", "")))):
+                texts.append(chunk)
+                metadatas.append({
+                    "specialty": str(row.get("medical_specialty", "")).strip(),
+                    "sample_name": str(row.get("sample_name", "")).strip(),
+                    "description": str(row.get("description", "")).strip(),
+                    "keywords": str(row.get("keywords", "")).strip(),
+                    "doc_index": int(i),
+                    "chunk_index": int(j),
+                })
+                ids.append(f"doc_{i}_chunk_{j}")
+
+        st.write(f"Embedding {len(texts)} chunks (this takes a few minutes)...")
+        collection = client.get_or_create_collection(
+            name=COLLECTION_NAME,
+            embedding_function=embed_fn,
+            metadata={"hnsw:space": "cosine"},
+        )
+        for start in range(0, len(texts), BATCH_SIZE):
+            end = min(start + BATCH_SIZE, len(texts))
+            collection.add(
+                documents=texts[start:end],
+                metadatas=metadatas[start:end],
+                ids=ids[start:end],
+            )
+
+        status.update(label=f"Index built: {collection.count():,} chunks", state="complete")
+
 
 # ---------------------------------------------------------------------------
 # Resource loading (cached)
@@ -151,14 +279,27 @@ def build_messages(user_query: str, chunks: list[dict], history: list[dict]) -> 
 # ---------------------------------------------------------------------------
 def main():
     st.set_page_config(page_title="Medical RAG Chatbot", page_icon="🏥", layout="wide")
+
+    # ---- Auth gate ----
+    authenticator = _load_authenticator()
+    authenticator.login()
+
+    if not st.session_state.get("authentication_status"):
+        if st.session_state.get("authentication_status") is False:
+            st.error("Username or password is incorrect")
+        else:
+            st.info("Please log in to continue")
+        st.stop()
+
     st.title("🏥 Medical RAG Chatbot")
-    st.caption("Powered by MTSamples + Ollama — fully local, fully private")
+    st.caption("Powered by MTSamples + Groq")
 
     # ---- Sidebar ----
     with st.sidebar:
+        authenticator.logout(location="sidebar")
         st.header("Settings")
 
-        model = st.text_input("Ollama model", value=DEFAULT_MODEL)
+        model = st.text_input("Groq model", value=DEFAULT_MODEL)
         embed_model = st.text_input("Embedding model", value=DEFAULT_EMBED_MODEL)
         db_path = st.text_input("Chroma DB path", value=DEFAULT_DB)
         top_k = st.slider("Retrieved chunks (top-K)", min_value=1, max_value=15, value=5)
@@ -201,6 +342,9 @@ def main():
     if "history" not in st.session_state:
         st.session_state.history = []
 
+    # ---- Ensure index exists (builds on first cold start) ----
+    _ensure_collection_built(db_path, embed_model, DEFAULT_CSV)
+
     # ---- Load collection ----
     try:
         collection = load_collection(db_path, embed_model)
@@ -231,6 +375,9 @@ def main():
     user_input = st.chat_input("Ask about medical notes, generate a SOAP note, ...") or pending
 
     if user_input:
+        # Audit log — record query immediately (char count only, not the text)
+        _audit(user_input)
+
         # Display user message
         st.session_state.messages.append({"role": "user", "content": user_input})
         with st.chat_message("user"):
@@ -246,14 +393,21 @@ def main():
         # Stream response
         with st.chat_message("assistant"):
             try:
-                import ollama as _ollama
+                from groq import Groq
 
-                stream = _ollama.chat(model=model, messages=messages, stream=True)
+                _groq = Groq(
+                    api_key=st.secrets.get("GROQ_API_KEY") or os.environ.get("GROQ_API_KEY")
+                )
+                stream = _groq.chat.completions.create(
+                    model=model, messages=messages, stream=True
+                )
                 response_text = st.write_stream(
-                    (chunk["message"]["content"] for chunk in stream if chunk["message"]["content"])
+                    chunk.choices[0].delta.content or ""
+                    for chunk in stream
+                    if chunk.choices[0].delta.content
                 )
             except Exception as e:
-                st.error(f"Ollama error: {e}\n\nIs Ollama running? Is model '{model}' pulled?")
+                st.error(f"Groq error: {e}")
                 response_text = ""
 
             if response_text and show_sources:

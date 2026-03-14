@@ -1,0 +1,10 @@
+credentials:
+  usernames:
+    tommy:
+      email: tommy@example.com
+      name: Tommy
+      password: "$2b$12$dwYNLiA3INk6Ksc7CokKXuOhZsbFCmx6PgCxrsYayIZrIZP/6.RTG"
+cookie:
+  expiry_days: 7
+  key: xk9mP2qRvL8nJwTzYdHsEaFcUbGiOe3N
+  name: medical_soap_auth
