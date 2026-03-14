@@ -18,3 +18,14 @@ AGENTS.md
 
 # Experimental code/artifacts
 dev/
+
+# RAG artifacts
+rag/chroma_db/
+
+# SFT pipeline artifacts
+sft/pairs.jsonl
+sft/pairs_progress.jsonl
+sft/output/
+sft/merged/
+sft/*.gguf
+sft/Modelfile

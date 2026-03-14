@@ -627,3 +627,15 @@ print(f"total_tokens_M:   {total_tokens / 1e6:.1f}")
 print(f"num_steps:        {step}")
 print(f"num_params_M:     {num_params / 1e6:.1f}")
 print(f"depth:            {DEPTH}")
+
+# Save checkpoint
+import dataclasses
+checkpoint = {
+    "model_state": model.state_dict(),
+    "config": dataclasses.asdict(config),
+    "val_bpb": val_bpb,
+    "step": step,
+    "depth": DEPTH,
+}
+torch.save(checkpoint, "model.pt")
+print(f"checkpoint:       model.pt  ({os.path.getsize('model.pt') / 1024 / 1024:.1f} MB)")
